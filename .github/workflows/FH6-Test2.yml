@@ -1,0 +1,111 @@
+name: FH6 Test 02 - Enhanced Barriers OFF
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test2:
+    runs-on: windows-2022
+    steps:
+      - name: Check out your fork
+        uses: actions/checkout@v4
+
+      - name: Verify upstream source revision
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expected = @{
+            'src/D3D12Proxy.cpp'      = '8a38af8b156c50ac507de06b4a2041d42ba696ab'
+            'src/D3D12ProxyStubs.asm' = 'f86a8dfc336144b99aaeb3a12890bb7fe34d18c1'
+            'src/d3d12_proxy.def'     = '064270b6e07a75be75d2a58554ac0c8c787afee9'
+          }
+          foreach ($file in $expected.Keys) {
+            if (-not (Test-Path -LiteralPath $file)) { throw "Missing source: $file" }
+            $actual = (& git hash-object $file).Trim()
+            if ($actual -ne $expected[$file]) {
+              throw "Source changed: $file ($actual). Refusing to patch unknown version."
+            }
+          }
+
+      - name: Remove incorrect VRAM hook and disable unsupported Enhanced Barriers spoof
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $path = 'src/D3D12Proxy.cpp'
+          $code = [System.IO.File]::ReadAllText((Resolve-Path $path).Path)
+          function Remove-Block([string]$start, [string]$end) {
+            $begin = $script:code.IndexOf($start, [StringComparison]::Ordinal)
+            if ($begin -lt 0) { throw "Missing start marker: $start" }
+            $finish = $script:code.IndexOf($end, $begin + $start.Length, [StringComparison]::Ordinal)
+            if ($finish -lt 0) { throw "Missing end marker: $end" }
+            $script:code = $script:code.Remove($begin, $finish - $begin)
+          }
+          Remove-Block '// SPOOF: Interceptador do orçamento de memória de vídeo' 'static HRESULT STDMETHODCALLTYPE HookedCheckFeatureSupport('
+          Remove-Block '    size_t queryVideoMemoryIndex = FindVtableEntryIndex(' '    __try {'
+          Remove-Block '        // Patch QueryVideoMemoryInfo if not already hooked' '    } __except (EXCEPTION_EXECUTE_HANDLER)'
+          $removeLines = @(
+            'using QueryVideoMemoryInfo_t = HRESULT(STDMETHODCALLTYPE*)(void*, UINT, int, void*);',
+            'static QueryVideoMemoryInfo_t g_originalQueryVideoMemoryInfo = nullptr;',
+            'static LONG g_loggedVideoMemoryInfo = 0;',
+            'static constexpr size_t kQueryVideoMemoryInfoVtableIndex = 56;',
+            '        InterlockedExchange(&g_loggedVideoMemoryInfo, 0);',
+            '        g_originalQueryVideoMemoryInfo = nullptr;'
+          )
+          foreach ($line in $removeLines) {
+            if (-not $code.Contains($line)) { throw "Expected line not found: $line" }
+            $code = $code.Replace($line, '')
+          }
+          $oldMessage = 'Log("Patch aplicado: ID3D12Device Spoof de Recursos e VRAM Ativos (lock system ativo)");'
+          if (-not $code.Contains($oldMessage)) { throw 'VRAM diagnostic message marker missing' }
+          $code = $code.Replace($oldMessage, 'Log("TEST 02: VRAM hook removed; Enhanced Barriers disabled");')
+          if ($code.Contains('HookedQueryVideoMemoryInfo') -or $code.Contains('queryVideoMemoryIndex')) {
+            throw 'Unexpected residual VRAM hook'
+          }
+          $old = 'opts12->EnhancedBarriersSupported = TRUE;'
+          if (($code.Split([string[]]@($old), [StringSplitOptions]::None).Length - 1) -ne 1) {
+            throw 'Expected exactly one EnhancedBarriersSupported spoof'
+          }
+          $code = $code.Replace($old, 'opts12->EnhancedBarriersSupported = FALSE;')
+          $oldLog = 'Log("SPOOF: EnhancedBarriersSupported FORCED TRUE");'
+          if (-not $code.Contains($oldLog)) { throw 'Missing Enhanced Barriers log marker' }
+          $code = $code.Replace($oldLog, 'Log("TEST 02: EnhancedBarriersSupported FORCED FALSE");')
+          [System.IO.File]::WriteAllText((Resolve-Path $path).Path, $code, [System.Text.UTF8Encoding]::new($false))
+          Write-Host 'Test 02 patch applied. No repository source files committed.'
+
+      - name: Build d3d12.dll with Windows MSVC
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path -LiteralPath $vswhere)) { throw 'vswhere not found' }
+          $vsPath = (& $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1)
+          if (-not $vsPath) { throw 'MSVC C++ tools not found' }
+          $vcvars = Join-Path $vsPath 'VC\Auxiliary\Build\vcvars64.bat'
+          if (-not (Test-Path -LiteralPath $vcvars)) { throw 'vcvars64.bat not found' }
+          New-Item -ItemType Directory -Force -Path TEST_BUILD | Out-Null
+          $batch = @(
+            '@echo off',
+            ('call "' + $vcvars + '"'),
+            'if errorlevel 1 exit /b 1',
+            'ml64 /nologo /c /Fo"TEST_BUILD\D3D12ProxyStubs.obj" "src\D3D12ProxyStubs.asm"',
+            'if errorlevel 1 exit /b 1',
+            'cl /nologo /EHsc /std:c++17 /LD "src\D3D12Proxy.cpp" "TEST_BUILD\D3D12ProxyStubs.obj" /Fe:"TEST_BUILD\d3d12.dll" /Fo:"TEST_BUILD\D3D12Proxy.obj" /link /DEF:"src\d3d12_proxy.def"',
+            'if errorlevel 1 exit /b 1'
+          )
+          [System.IO.File]::WriteAllLines((Join-Path (Get-Location) 'build-test2.cmd'), $batch, [System.Text.Encoding]::ASCII)
+          & cmd.exe /d /c build-test2.cmd
+          if ($LASTEXITCODE -ne 0) { throw "Compilation failed with exit code $LASTEXITCODE" }
+          if (-not (Test-Path -LiteralPath TEST_BUILD/d3d12.dll)) { throw 'DLL missing' }
+          $hash = (Get-FileHash -LiteralPath TEST_BUILD/d3d12.dll -Algorithm SHA256).Hash
+          Write-Host "Test02 DLL compiled; SHA256=$hash"
+
+      - name: Upload diagnostic DLL
+        uses: actions/upload-artifact@v4
+        with:
+          name: FH6-Test2-d3d12-EnhancedBarriersOFF
+          path: TEST_BUILD/d3d12.dll
+          if-no-files-found: error
+          retention-days: 7
